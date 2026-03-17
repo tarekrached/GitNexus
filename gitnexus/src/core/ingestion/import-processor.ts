@@ -15,7 +15,9 @@ import {
   loadComposerConfig,
   loadCSharpProjectConfig,
   loadSwiftPackageConfig,
+  loadPythonSourceRoots,
   type SwiftPackageConfig,
+  type PythonSourceRootsConfig,
 } from './language-config.js';
 import {
   buildSuffixIndex,
@@ -32,6 +34,7 @@ import {
   resolveRustImport,
   resolveRubyImport,
   resolvePythonImport,
+  resolvePythonSourceRootImport,
 } from './resolvers/index.js';
 import { callRouters } from './call-routing.js';
 import type { ResolutionContext } from './resolution-context.js';
@@ -115,6 +118,7 @@ interface LanguageConfigs {
   composerConfig: ComposerConfig | null;
   swiftPackageConfig: SwiftPackageConfig | null;
   csharpConfigs: CSharpProjectConfig[];
+  pythonSourceRoots: PythonSourceRootsConfig | null;
 }
 
 /** Context for import path resolution (file lists, indexes, cache). */
@@ -149,7 +153,7 @@ function resolveLanguageImport(
   ctx: ResolveCtx,
 ): ImportResult {
   const { allFilePaths, allFileList, normalizedFileList, index, resolveCache } = ctx;
-  const { tsconfigPaths, goModule, composerConfig, swiftPackageConfig, csharpConfigs } = configs;
+  const { tsconfigPaths, goModule, composerConfig, swiftPackageConfig, csharpConfigs, pythonSourceRoots } = configs;
 
   // JVM languages (Java + Kotlin): handle wildcards and member imports
   if (language === SupportedLanguages.Java || language === SupportedLanguages.Kotlin) {
@@ -220,12 +224,19 @@ function resolveLanguageImport(
     return null; // External framework (Foundation, UIKit, etc.)
   }
 
-  // Python: relative imports (PEP 328) + proximity-based bare imports
-  // Falls through to standard suffix resolution when proximity finds no match.
+  // Python: relative imports (PEP 328) + source root resolution + proximity-based bare imports
+  // Falls through to standard suffix resolution when no match found.
   if (language === SupportedLanguages.Python) {
+    // 1. Relative + proximity (existing logic)
     const resolved = resolvePythonImport(filePath, rawImportPath, allFilePaths);
     if (resolved) return { kind: 'files', files: [resolved] };
     if (rawImportPath.startsWith('.')) return null; // relative but unresolved — don't suffix-match
+
+    // 2. Source root resolution (e.g., Pants monorepo: "projects/pkg_core/clients/base.py")
+    if (pythonSourceRoots) {
+      const rootResolved = resolvePythonSourceRootImport(rawImportPath, pythonSourceRoots, allFilePaths);
+      if (rootResolved) return { kind: 'files', files: [rootResolved] };
+    }
   }
 
   // Ruby: require / require_relative
@@ -345,6 +356,7 @@ export const processImports = async (
     composerConfig: await loadComposerConfig(effectiveRoot),
     swiftPackageConfig: await loadSwiftPackageConfig(effectiveRoot),
     csharpConfigs: await loadCSharpProjectConfig(effectiveRoot),
+    pythonSourceRoots: await loadPythonSourceRoots(effectiveRoot),
   };
   const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache };
 
@@ -518,6 +530,7 @@ export const processImportsFromExtracted = async (
     composerConfig: await loadComposerConfig(effectiveRoot),
     swiftPackageConfig: await loadSwiftPackageConfig(effectiveRoot),
     csharpConfigs: await loadCSharpProjectConfig(effectiveRoot),
+    pythonSourceRoots: await loadPythonSourceRoots(effectiveRoot),
   };
   const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache };
 

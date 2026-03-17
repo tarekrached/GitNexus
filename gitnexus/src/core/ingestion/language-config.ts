@@ -35,6 +35,17 @@ export interface CSharpProjectConfig {
   projectDir: string;
 }
 
+/** Python source roots config — maps top-level import names to filesystem directories */
+export interface PythonSourceRootsConfig {
+  /**
+   * Ordered list of source root directories (relative to repo root).
+   * Each root is a directory where Python packages live as direct children.
+   * e.g., ["projects", "libraries/python"] means `from pkg_core.clients.base import X`
+   * resolves to `projects/pkg_core/clients/base.py`.
+   */
+  sourceRoots: string[];
+}
+
 /** Swift Package Manager module config */
 export interface SwiftPackageConfig {
   /** Map of target name -> source directory path (e.g., "SiuperModel" -> "Package/Sources/SiuperModel") */
@@ -212,4 +223,160 @@ export async function loadSwiftPackageConfig(repoRoot: string): Promise<SwiftPac
     return { targets };
   }
   return null;
+}
+
+/**
+ * Discover Python source roots for a repository.
+ *
+ * Discovery order (first match wins):
+ * 1. `.gitnexus/python.json` — manual override: `{ "sourceRoots": ["src", "lib"] }`
+ * 2. `pants.toml` — Pants monorepo: scan for directories containing BUILD files
+ *    with `python_sources` or `python_library` targets, then infer roots.
+ *    Uses `[source].root_patterns` if defined, otherwise uses Pants' default
+ *    marker files (pyproject.toml, setup.py, setup.cfg) to detect roots.
+ * 3. `pyproject.toml` — single-project: check tool.setuptools.packages.find.where,
+ *    tool.poetry.packages, or default "src" layout.
+ *
+ * Falls back to scanning for common root directories (src/, lib/, projects/, libraries/).
+ */
+export async function loadPythonSourceRoots(repoRoot: string): Promise<PythonSourceRootsConfig | null> {
+  // 1. Manual override via .gitnexus/python.json
+  try {
+    const configPath = path.join(repoRoot, '.gitnexus', 'python.json');
+    const raw = await fs.readFile(configPath, 'utf-8');
+    const config = JSON.parse(raw);
+    if (Array.isArray(config.sourceRoots) && config.sourceRoots.length > 0) {
+      const sourceRoots = config.sourceRoots.map((r: string) => r.replace(/\/+$/, ''));
+      if (isDev) {
+        console.log(`🐍 Loaded ${sourceRoots.length} Python source roots from .gitnexus/python.json`);
+      }
+      return { sourceRoots };
+    }
+  } catch {
+    // No manual config
+  }
+
+  // 2. Pants monorepo detection via pants.toml
+  try {
+    const pantsTomlPath = path.join(repoRoot, 'pants.toml');
+    await fs.access(pantsTomlPath);
+
+    // Pants uses marker files to detect source roots. The default markers are
+    // pyproject.toml, setup.py, setup.cfg, and BUILD files at root level.
+    // We scan for directories that contain __init__.py as direct children
+    // (i.e., are Python package roots) and look for common Pants source root patterns.
+    const sourceRoots = await discoverPantsSourceRoots(repoRoot);
+    if (sourceRoots.length > 0) {
+      if (isDev) {
+        console.log(`🐍 Discovered ${sourceRoots.length} Pants source roots: ${sourceRoots.join(', ')}`);
+      }
+      return { sourceRoots };
+    }
+  } catch {
+    // No pants.toml
+  }
+
+  // 3. pyproject.toml — setuptools or poetry
+  try {
+    const pyprojectPath = path.join(repoRoot, 'pyproject.toml');
+    const raw = await fs.readFile(pyprojectPath, 'utf-8');
+
+    // Quick TOML parsing for common patterns (no full TOML parser dependency)
+    // Look for: [tool.setuptools.packages.find] where = ["src"]
+    const whereMatch = raw.match(/\[tool\.setuptools\.packages\.find\][^[]*where\s*=\s*\["([^"]+)"\]/s);
+    if (whereMatch) {
+      if (isDev) {
+        console.log(`🐍 Loaded Python source root from pyproject.toml: ${whereMatch[1]}`);
+      }
+      return { sourceRoots: [whereMatch[1]] };
+    }
+
+    // Look for src/ layout (PEP 517 convention)
+    try {
+      await fs.access(path.join(repoRoot, 'src'));
+      if (isDev) {
+        console.log(`🐍 Detected src/ layout from pyproject.toml presence`);
+      }
+      return { sourceRoots: ['src'] };
+    } catch {
+      // No src/ directory
+    }
+  } catch {
+    // No pyproject.toml
+  }
+
+  return null;
+}
+
+/**
+ * Discover source roots in a Pants monorepo by scanning for directories
+ * that are parents of Python packages (directories with __init__.py).
+ *
+ * Strategy: Look for well-known Pants source root patterns. Pants' default
+ * `root_patterns` include directories like `src/python`, `src/py`, `src`,
+ * and any directory containing a `setup.py`, `setup.cfg`, or `pyproject.toml`.
+ * In practice, monorepos use patterns like `projects/`, `libraries/python/`, etc.
+ *
+ * We scan up to 3 levels deep for directories that:
+ * - Contain at least one subdirectory with `__init__.py` (are package roots)
+ * - OR contain a BUILD file (Pants target definition)
+ */
+async function discoverPantsSourceRoots(repoRoot: string): Promise<string[]> {
+  const roots = new Set<string>();
+  const maxDepth = 3;
+  const maxDirs = 200;
+  let dirsScanned = 0;
+
+  const scanQueue: { dir: string; depth: number; rel: string }[] = [
+    { dir: repoRoot, depth: 0, rel: '' },
+  ];
+
+  // Skip directories that are never source roots
+  const skipDirs = new Set([
+    'node_modules', '.git', '.pants.d', 'pants.d', '__pycache__',
+    '.mypy_cache', '.pytest_cache', 'dist', 'build', '.tox', '.venv',
+    'venv', '.gitnexus',
+  ]);
+
+  while (scanQueue.length > 0 && dirsScanned < maxDirs) {
+    const { dir, depth, rel } = scanQueue.shift()!;
+    dirsScanned++;
+
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      const subdirs: { name: string; path: string }[] = [];
+      let hasInitPy = false;
+
+      for (const entry of entries) {
+        if (entry.isFile() && entry.name === '__init__.py') {
+          hasInitPy = true;
+        }
+        if (entry.isDirectory() && !skipDirs.has(entry.name) && !entry.name.startsWith('.')) {
+          subdirs.push({ name: entry.name, path: path.join(dir, entry.name) });
+        }
+      }
+
+      // If this directory has __init__.py, its parent is a source root
+      if (hasInitPy && rel) {
+        // The parent directory (one level up) is the source root
+        const parentRel = rel.split('/').slice(0, -1).join('/');
+        if (parentRel) {
+          roots.add(parentRel);
+        }
+      }
+
+      // Continue scanning subdirectories
+      if (depth < maxDepth) {
+        for (const subdir of subdirs) {
+          const subRel = rel ? `${rel}/${subdir.name}` : subdir.name;
+          scanQueue.push({ dir: subdir.path, depth: depth + 1, rel: subRel });
+        }
+      }
+    } catch {
+      // Can't read directory
+    }
+  }
+
+  // Sort by specificity (longer paths first) so more specific roots match before generic ones
+  return [...roots].sort((a, b) => b.length - a.length);
 }

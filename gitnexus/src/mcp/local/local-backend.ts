@@ -895,13 +895,36 @@ export class LocalBackend {
     const sym = symbols[0];
     const symId = sym.id || sym[0];
 
-    // Categorized incoming refs
+    // Categorized incoming refs (symbol-level edges)
     const incomingRows = await executeParameterized(repo.id, `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
       WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
       RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
       LIMIT 30
     `, { symId });
+
+    // File-level IMPORTS bridge: symbol ←DEFINES— file ←IMPORTS— importingFile —DEFINES→ symbols
+    // This surfaces cross-project consumers that import the file containing this symbol.
+    try {
+      const fileBridgeRows = await executeParameterized(repo.id, `
+        MATCH (f:File)-[:CodeRelation {type: 'DEFINES'}]->(n {id: $symId})
+        MATCH (importingFile:File)-[:CodeRelation {type: 'IMPORTS'}]->(f)
+        MATCH (importingFile)-[:CodeRelation {type: 'DEFINES'}]->(sym)
+        WHERE sym.id <> $symId AND labels(sym)[0] <> 'File'
+        RETURN 'imported_by' AS relType, sym.id AS uid, sym.name AS name, sym.filePath AS filePath, labels(sym)[0] AS kind
+        LIMIT 30
+      `, { symId });
+
+      // Dedupe against existing incoming rows
+      const existingUids = new Set(incomingRows.map((r: any) => r.uid || r[1]));
+      for (const row of fileBridgeRows) {
+        const rowUid = row.uid || row[1];
+        if (!existingUids.has(rowUid)) {
+          incomingRows.push(row);
+          existingUids.add(rowUid);
+        }
+      }
+    } catch (e) { logQueryError('context:file-bridge', e); }
 
     // Categorized outgoing refs
     const outgoingRows = await executeParameterized(repo.id, `
@@ -1370,13 +1393,13 @@ export class LocalBackend {
       
       try {
         const related = await executeQuery(repo.id, query);
-        
+
         for (const rel of related) {
           const relId = rel.id || rel[1];
           const filePath = rel.filePath || rel[4] || '';
-          
+
           if (!includeTests && isTestFilePath(filePath)) continue;
-          
+
           if (!visited.has(relId)) {
             visited.add(relId);
             nextFrontier.push(relId);
@@ -1392,7 +1415,43 @@ export class LocalBackend {
           }
         }
       } catch (e) { logQueryError('impact:depth-traversal', e); }
-      
+
+      // File-level IMPORTS bridge: for frontier symbols with no symbol-level dependents,
+      // bridge through file-level IMPORTS edges to find cross-project consumers.
+      if (relationTypes.includes('IMPORTS')) {
+        try {
+          const bridgeIdList = frontier.map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+          if (bridgeIdList) {
+            const visitedList = [...visited].map(id => `'${id.replace(/'/g, "''")}'`).join(', ');
+            const bridgeQuery = direction === 'upstream'
+              ? `MATCH (f:File)-[:CodeRelation {type: 'DEFINES'}]->(n) WHERE n.id IN [${bridgeIdList}] MATCH (importingFile:File)-[:CodeRelation {type: 'IMPORTS'}]->(f) MATCH (importingFile)-[:CodeRelation {type: 'DEFINES'}]->(sym) WHERE NOT sym.id IN [${visitedList}] AND labels(sym)[0] <> 'File' RETURN n.id AS sourceId, sym.id AS id, sym.name AS name, labels(sym)[0] AS type, sym.filePath AS filePath, 'IMPORTS' AS relType, 1.0 AS confidence`
+              : `MATCH (n)-[:CodeRelation {type: 'DEFINES'}]->(:File)-[:CodeRelation {type: 'IMPORTS'}]->(importedFile:File) WHERE n.id IN [${bridgeIdList}] MATCH (importedFile)-[:CodeRelation {type: 'DEFINES'}]->(sym) WHERE NOT sym.id IN [${visitedList}] AND labels(sym)[0] <> 'File' RETURN n.id AS sourceId, sym.id AS id, sym.name AS name, labels(sym)[0] AS type, sym.filePath AS filePath, 'IMPORTS' AS relType, 1.0 AS confidence`;
+
+            const bridgeResults = await executeQuery(repo.id, bridgeQuery);
+            for (const rel of bridgeResults) {
+              const relId = rel.id || rel[1];
+              const filePath = rel.filePath || rel[4] || '';
+
+              if (!includeTests && isTestFilePath(filePath)) continue;
+
+              if (!visited.has(relId)) {
+                visited.add(relId);
+                nextFrontier.push(relId);
+                impacted.push({
+                  depth,
+                  id: relId,
+                  name: rel.name || rel[2],
+                  type: rel.type || rel[3],
+                  filePath,
+                  relationType: 'IMPORTS',
+                  confidence: 1.0,
+                });
+              }
+            }
+          }
+        } catch (e) { logQueryError('impact:file-bridge', e); }
+      }
+
       frontier = nextFrontier;
     }
     

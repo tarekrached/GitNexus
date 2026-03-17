@@ -1,9 +1,11 @@
 /**
- * Python import resolution — PEP 328 relative imports and proximity-based bare imports.
+ * Python import resolution — PEP 328 relative imports, source root resolution,
+ * and proximity-based bare imports.
  * Import system spec: PEP 302 (original), PEP 451 (current).
  */
 
 import { tryResolveWithExtensions } from './utils.js';
+import type { PythonSourceRootsConfig } from '../language-config.js';
 
 /**
  * Resolve a Python import to a file path.
@@ -54,6 +56,41 @@ export function resolvePythonImport(
 
   if (allFiles.has(`${importerDir}/${pathLike}/__init__.py`)) return `${importerDir}/${pathLike}/__init__.py`;
   if (allFiles.has(`${importerDir}/${pathLike}.py`)) return `${importerDir}/${pathLike}.py`;
+
+  return null;
+}
+
+/**
+ * Resolve a Python import via configured source roots.
+ *
+ * For bare imports like `from pkg_core.clients.base import CoreClient`, tries each
+ * source root as a prefix to locate the target file. For example, with source root
+ * "projects", resolves `pkg_core.clients.base` to `projects/pkg_core/clients/base.py`.
+ *
+ * Source roots are tried in order (most specific first when auto-discovered).
+ * Returns the first match, or null to fall through to suffix resolution.
+ */
+export function resolvePythonSourceRootImport(
+  importPath: string,
+  sourceRootsConfig: PythonSourceRootsConfig,
+  allFiles: Set<string>,
+): string | null {
+  // Only handle bare (non-relative) imports
+  if (importPath.startsWith('.')) return null;
+
+  const pathLike = importPath.replace(/\./g, '/');
+
+  for (const root of sourceRootsConfig.sourceRoots) {
+    const basePath = root ? `${root}/${pathLike}` : pathLike;
+
+    // Try as a module file first (e.g. pkg_core/clients/base.py)
+    const asFile = tryResolveWithExtensions(basePath, allFiles);
+    if (asFile) return asFile;
+
+    // Try as a package (__init__.py) — handles `from pkg_core import X`
+    // where pkg_core is a package directory
+    if (allFiles.has(`${basePath}/__init__.py`)) return `${basePath}/__init__.py`;
+  }
 
   return null;
 }

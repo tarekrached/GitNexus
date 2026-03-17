@@ -1171,3 +1171,44 @@ describe('Python member access iterable for-loop', () => {
     expect(repoSave).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Source root resolution: cross-project imports in monorepos (e.g., Pants)
+// Uses .gitnexus/python.json to configure source roots so that
+// `from pkg_core.clients.base import CoreClient` in libraries/python/
+// resolves to projects/pkg_core/clients/base.py
+// ---------------------------------------------------------------------------
+
+describe('Python source root resolution (monorepo cross-project imports)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-source-roots'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects CoreClient and DataConsumer classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('CoreClient');
+    expect(getNodesByLabel(result, 'Class')).toContain('DataConsumer');
+  });
+
+  it('resolves cross-project import: consumer.py → base.py via source roots', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const crossImport = imports.find(e =>
+      e.sourceFilePath === 'libraries/python/pkg_consumer/inputs/consumer.py'
+      && e.targetFilePath === 'projects/pkg_core/clients/base.py',
+    );
+    expect(crossImport).toBeDefined();
+  });
+
+  it('resolves DataConsumer.client.get_data() call to CoreClient.get_data', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getCall = calls.find(c =>
+      c.target === 'get_data' && c.targetFilePath === 'projects/pkg_core/clients/base.py',
+    );
+    expect(getCall).toBeDefined();
+    expect(getCall!.source).toBe('fetch');
+  });
+});
